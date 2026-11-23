@@ -1,4 +1,6 @@
 opencv-python>=4.8,<5
 # Python 3.13 requires a NumPy 2.x wheel.
 numpy>=2,<3
+rapidocr>=3.10,<4
+onnxruntime>=1.16,<2
 easyocr>=1.7,<2
