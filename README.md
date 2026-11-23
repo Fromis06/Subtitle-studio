@@ -1,161 +1,162 @@
-# SRT Getter
+# Subtitle Studio
 
-This project extracts subtitles from video with a hybrid Go + Python workflow:
+Subtitle Studio is a Windows desktop application that extracts hardcoded subtitles from video files into `.srt` subtitles using a hybrid Go + Python + React pipeline:
 
-- React provides video selection, frame preview, crop selection, settings, progress, and results.
-- Go manages the job lifecycle, communicates with the Python worker, supports cancellation, and exports SRT.
-- Python uses OpenCV for fast frame analysis and EasyOCR for text recognition.
+- **React (Wails Frontend)**: Video preview, interactive ROI crop selection, scan presets, progress monitoring, and inline SRT editing.
+- **Go (Wails Backend)**: Job lifecycle management, Go-to-Python JSON-lines worker bridge, cancellation support, and `.srt` formatting/export.
+- **Python Engine**: OpenCV frame analysis paired with hybrid **RapidOCR** (PP-OCRv6 / PP-OCRv5) and **EasyOCR** (CUDA-accelerated when configured).
 
-![alt text](https://files.catbox.moe/nhm8xp.gif)
+![Subtitle Studio demo](docs/subtitle-studio.gif)
 
-## Core idea
+---
 
-The expensive operation is OCR. Running OCR on every sampled frame wastes GPU time because the same subtitle may remain on screen for many frames. This project separates the problem into two stages:
+## Core Idea
 
-1. Use lightweight image math to find when a subtitle starts and ends.
-2. Run OCR once per detected subtitle segment, using GPU batches.
+The expensive operation in subtitle extraction is OCR. A naive implementation that runs OCR on every sampled video frame wastes substantial GPU/CPU time, because the same subtitle typically stays visible on screen across many consecutive samples.
 
-This means the system does not ask OCR to solve a timing problem that can be handled cheaply with pixel comparison.
+This project separates the problem into two stages:
 
-## Subtitle detection workflow
+1. Use lightweight image math to detect when a subtitle appears and disappears.
+2. Run OCR once per detected subtitle segment, using batches (`OCR_BATCH_SIZE = 8`).
 
-For a video of duration `T`, the main loop samples frames at `step_sec`:
+This means the system does not ask an OCR model to solve a timing problem that can be handled orders of magnitude faster with pixel and edge comparison.
+
+---
+
+## Subtitle Detection Workflow
+
+For a video of duration $T$, the main scan loop samples frames at `step_sec`:
 
 ```text
-video → sample frame → crop subtitle region → has_text()
-                                      ├─ no candidate → next sample
-                                      └─ candidate → find t_end() → OCR batch
+video -> sample frame -> crop subtitle region -> has_text()
+                                                   |- no candidate -> next sample
+                                                   '- candidate -> _find_t_end() -> 3-frame median -> OCR batch
 ```
 
-The scan loop and OCR run as overlapping pipeline stages. Once a crop batch is submitted to the OCR worker, the main loop continues with `has_text()`, frame scanning, and `find_t_end()` instead of waiting for OCR to finish:
+The scan loop and OCR inference run as overlapping pipeline stages via a background worker thread (`ThreadPoolExecutor`). Once a batch of crops is submitted to the OCR worker, the main loop immediately continues scanning, filtering with `has_text()`, and refining boundaries instead of stalling for OCR to finish:
 
 $$
 T_{serial} = T_{scan} + T_{ocr}
 $$
 
 $$
-T_{pipeline} \approx \max(T_{scan}, T_{ocr})
+T_{pipeline} \approx \max(T_{scan},\; T_{ocr})
 $$
 
-Because OCR is usually much slower than `has_text()`, the fast detection work is largely hidden inside the OCR time. This is a small optimization, but it prevents the scan loop from unnecessarily blocking on each OCR batch.
+Because OCR inference is much slower than OpenCV edge comparison, fast frame scanning is largely hidden inside the OCR latency rather than stacking sequentially on top of it.
 
-### 1. Crop the configured region
+### 1. Crop the Configured Region
 
-The frontend returns normalized coordinates:
+The frontend sends normalized coordinates:
 
 ```text
 crop_box = (x_min, x_max, y_min, y_max)
 ```
 
-Each value is between `0` and `1`. For a frame of width `W` and height `H`:
+Each value is in $[0, 1]$. For a frame of width $W$ and height $H$:
 
 ```text
-x_start = W × x_min
-x_end   = W × x_max
-y_start = H × y_min
-y_end   = H × y_max
+x_start = W * x_min
+x_end   = W * x_max
+y_start = H * y_min
+y_end   = H * y_max
 ```
 
-Only this region is used by the detection and OCR stages.
+Only this cropped band enters the detection, timing, and OCR stages.
 
-### 2. Cheap candidate filtering with `has_text()`
+### 2. Cheap Candidate Filtering with `has_text()`
 
-`SubtitleOCR.has_text()` is a lightweight OpenCV filter. It does not run EasyOCR. It combines:
+`SubtitleOCR.has_text()` is a lightweight OpenCV gate. It never invokes RapidOCR or EasyOCR. It combines:
 
-- grayscale conversion;
-- a bright-pixel mask;
-- Canny edges;
-- morphological closing;
-- active-row counting.
+- Grayscale conversion (`BGR -> GRAY`);
+- Canny edge detection (`85, 185`) to target crisp character strokes rather than flat bright blobs (shirts, sky, or light panels);
+- Horizontal `3x1` morphological dilation to bridge closely spaced letter strokes;
+- Active-row counting across the crop height.
 
-Frames that clearly contain no text are discarded before the timing comparison and OCR stages.
+Frames without sufficient text-like edge density are discarded immediately before timing comparison or OCR.
 
-### 3. Capture the anchor frame
+### 3. Capture the Anchor Frame
 
-When a candidate is found at `t_start`, its crop becomes the anchor image `A`:
+When `has_text()` triggers at timestamp $t_{start}$, its crop becomes the visual reference anchor $A$:
 
 ```text
 A = anchor crop at t_start
 ```
 
-The anchor is the visual reference for the rest of that subtitle segment.
+### 4. Build the Text-Focused Anchor Signature
 
-### 4. Build the anchor edge signature
-
-`MathEngine.compute_anchor_signature()` converts the anchor to grayscale and extracts its edges:
+`MathEngine.compute_anchor_signature()` converts $A$ to grayscale and extracts edges $E_A$:
 
 $$
-G_A = Gray(A)
+G_A = \text{Gray}(A)
 $$
 
 $$
-E_A = Canny(G_A, 100, 200)
+E_A = \text{Canny}(G_A, 90, 180) \cap \text{Dilate}_{7\times 7}(G_A \ge 165)
 $$
 
-`E_A` is a binary mask representing important edges, usually the strokes and outlines of the subtitle text. The number of edge pixels is also counted:
+When at least $15$ edge pixels fall inside the bright-stroke band ($G_A \ge 165$), $E_A$ isolates subtitle outlines instead of background clutter (otherwise full Canny edges are used). The total anchor edge count is:
 
 $$
 N_E = \sum_{x,y} E_A(x,y)
 $$
 
-If `N_E < 10`, the anchor has too little visual information and is rejected as unstable.
+If $N_E < 10$, the candidate has insufficient visual structure and is rejected.
 
-### 5. Compare each following frame without OCR
+### 5. Track Subtitle Boundaries Without OCR
 
-For a later crop `F_t`, the algorithm first converts it to grayscale:
+For each subsequent crop $F_t$ sampled every `boundary_step` seconds (default `0.10s`, stepping sequentially via `cap.grab()`), `MathEngine` converts it to grayscale:
 
 $$
-G_t = Gray(F_t)
+G_t = \text{Gray}(F_t)
 $$
 
-Then it computes the absolute pixel difference:
+and measures the absolute pixel difference against the anchor:
 
 $$
 D_t(x,y) = |G_A(x,y) - G_t(x,y)|
 $$
 
-With the current threshold `τ = 20`, a pixel is considered stable when its difference is small enough:
+With the current threshold $\tau = 26$, pixels whose difference stays within tolerance form the static mask $M_t$:
 
 $$
-M_t(x,y) =
-\begin{cases}
-1 & \text{if } D_t(x,y) \le 20 \\
-0 & \text{otherwise}
-\end{cases}
+M_t(x,y) = \begin{cases} 1 & \text{if } D_t(x,y) \le 26 \\ 0 & \text{otherwise} \end{cases}
 $$
 
-The two grayscale subtitle crops being compared should look like this:
+The two grayscale subtitle crops being compared behave like this:
 
 ![Example grayscale subtitle frame](docs/grayscale-subtitle-frame.svg)
 
-The comparison is restricted to the anchor edge mask. This avoids treating the whole video background as subtitle evidence:
+Comparison is restricted to the anchor edge mask $E_A$, combined with a symmetric guard against newly appearing caption strokes on changed pixels:
 
 $$
-S_t = \frac{\sum_{x,y} E_A(x,y) \cdot M_t(x,y)}{\sum_{x,y} E_A(x,y)}
+S_t = \frac{\sum_{x,y} E_A(x,y) \cdot M_t(x,y)}{N_E}
 $$
 
-`S_t` is the stable edge ratio.
+$$
+N_{\text{new}} = \sum_{x,y} \left( E_t(x,y) \cdot (1 - M_t(x,y)) \right)
+$$
 
-The current decision rule is:
-
-```text
-S_t > 0.40  → subtitle is still present
-S_t ≤ 0.40  → subtitle has changed or disappeared
-```
-
-`_find_t_end()` evaluates this every `boundary_step` seconds, defaulting to `0.1s`. When the ratio drops below the threshold, the previous stable timestamp becomes `t_end`.
-
-### 6. Run OCR only after timing is known
-
-Once `(t_start, t_end, anchor_crop)` is known, the crop is added to `pending_ocr`. The OCR call is delayed until the batch is full or the video ends.
-
-The current default batch size is `8`:
+The current decision rule for keeping a subtitle active is:
 
 ```text
-pending crops → readtext_batched() → confidence filter → reading order → subtitle result
+S_t > 0.45  AND  N_new <= max(200, int(0.85 * N_E))  -> subtitle is still the same
+Otherwise                                            -> subtitle changed or disappeared (lock t_end)
 ```
 
-The final result has this shape:
+Restricting $S_t$ to $E_A$ prevents moving background behind static text from falsely splitting a caption, while checking $N_{\text{new}}$ catches rapid subtitle replacements that happen to share bright pixels in the same region.
+
+### 6. Select Representative Frame & Batch OCR After Timing
+
+Instead of running OCR on the very first anchor frame (which may still be fading in or noisy), `_select_representative_crop()` keeps up to $12$ stable frames across $[t_{start}, t_{end}]$ and computes the pixel-wise median of the `25%`, `50%`, and `75%` samples.
+
+Once `(t_start, t_end, representative_crop)` is finalized, it is pushed to `pending_ocr`. Crops are processed in batches of $B = 8$ (`OCR_BATCH_SIZE`):
+
+```text
+pending crops (B = 8) -> optional bright-text isolation -> RapidOCR / EasyOCR -> confidence & text filter -> fuzzy merge
+```
+
+Consecutive cues separated by tiny gaps (`<= max(0.6 * step_sec, 3 * boundary_step, 0.35s)`) with normalized text similarity $\ge 0.84$ are merged automatically, emitting clean segments of the form:
 
 ```json
 {
@@ -165,67 +166,101 @@ The final result has this shape:
 }
 ```
 
-## Why this reduces OCR time
+---
+
+## Why This Reduces OCR Time
 
 Let:
 
-- `N` = number of sampled frames;
-- `K` = number of detected subtitle segments;
-- `B` = OCR batch size, currently `8`;
-- `C_ocr` = cost of one OCR operation;
-- `C_math` = much cheaper grayscale/diff/edge comparison cost.
+- $N$ = number of sampled frames checked across the video
+- $K$ = number of detected subtitle segments
+- $B$ = OCR batch size (currently $8$)
+- $C_{\text{ocr}}$ = cost of one OCR inference call
+- $C_{\text{math}}$ = cost of OpenCV grayscale, diff, and edge checks
 
-A naive approach that runs OCR on every sampled frame costs approximately:
-
-$$
-T_{naive} \approx N \cdot C_{ocr}
-$$
-
-The current workflow costs approximately:
+A **naive approach** that executes OCR on every sampled frame pays approximately:
 
 $$
-T_{current} \approx N \cdot C_{math} + \left\lceil\frac{K}{B}\right\rceil \cdot C_{ocr}
+T_{\text{naive}} \approx N \cdot C_{\text{ocr}}
 $$
 
-Because normally `K << N` and `C_math << C_ocr`, the GPU does far fewer expensive recognition calls. A representative application time allocation is:
+This workflow reduces total work to:
+
+$$
+T_{\text{current}} \approx N \cdot C_{\text{math}} + \left\lceil\frac{K}{B}\right\rceil \cdot C_{\text{ocr}}
+$$
+
+Because typically $K \ll N$ and $C_{\text{math}} \ll C_{\text{ocr}}$, expensive recognition runs only once per distinct subtitle cue and is amortized into GPU/ONNX batches. A representative stage timing breakdown looks like:
 
 | Stage | Share |
 |---|---:|
 | Frame positioning (`position`) | 0.8% |
 | Fast text candidate filter (`has_text`) | 0.7% |
 | Subtitle end detection (`find_t_end`) | 12.7% |
-| GPU OCR (`read_text`) | 85.8% |
+| Batched OCR (`read_text`) | 85.8% |
 | **Total** | **100%** |
 
-This profile shows why OCR batching and avoiding OCR on every frame matter most. The exact proportions vary with video resolution, GPU, subtitle density, and EasyOCR settings, but the same pattern is expected: `read_text` is the dominant cost, while frame positioning and math-based filtering remain relatively cheap.
+This profile shows why avoiding per-frame OCR and batching `read_text` calls delivers the largest speedup: frame seeking and pixel math remain minor overhead while recognition accounts for the vast majority of execution time (exact proportions vary with video resolution, GPU, subtitle density, and language engine).
 
-## Project structure
+---
+
+## Features & Language Routing
+
+- **Interactive Frame & ROI Monitor**: Seek or step (`-5s`, `-1s`, `+1s`, `+5s`) through video frames immediately at startup while OCR models finish loading in the background; includes `Bottom`, `Bottom Wide`, `Top`, and `Full` crop presets.
+- **Multilingual Hybrid OCR**:
+  - **Auto / English / Japanese / Chinese**: `RapidOCR` with **PP-OCRv6** (`det_small` + `rec_medium` via ONNX Runtime).
+  - **Korean**: `RapidOCR` with **PP-OCRv5 Korean**.
+  - **Vietnamese + English**: **PP-OCRv6** line detector combined with **EasyOCR** (`vi`, `en`) recognition (CUDA GPU when available).
+- **Preprocessing Modes**: `Natural` (recommended for colored or clean subtitles) and `Isolate Bright Text` (HSV bright-stroke + dark-halo component filtering for cluttered backgrounds).
+- **Inline Subtitle Editor**: Seek directly to any cue's timestamp, edit text inline, filter or merge cues, and export `.srt`.
+
+---
+
+## Project Structure
 
 ```text
-subtitle/
-├─ engine/
-│  ├─ worker.py              # Persistent JSON-lines worker
-│  ├─ algorithm.py           # Video scan and subtitle timing
-│  ├─ math_engine.py         # Grayscale, edge, and matrix comparison
-│  └─ models/ocr_engine.py   # EasyOCR and preprocessing
-├─ frontend/
-│  └─ src/App.tsx            # React workflow UI
-├─ app.go                    # Wails methods and job state
-├─ worker.go                 # Go ↔ Python process bridge
-└─  srt.go                   # SRT formatting and saving
-
+SRT getter/
+├── app.go                         # Wails bound methods, validation, job state, SRT export
+├── main.go                        # Wails window setup and embedded frontend assets
+├── worker.go                      # Go <-> Python subprocess & JSON-lines bridge
+├── srt.go                         # SRT formatting and file export
+├── wails.json                     # Wails build configuration
+├── build/
+│   ├── appicon.png                # Application icon (1024x1024)
+│   └── windows/                   # Windows icon, manifest, and metadata
+├── docs/
+│   ├── subtitle-studio.gif        # Application demo recording
+│   └── grayscale-subtitle-frame.svg
+├── engine/
+│   ├── worker.py                  # Persistent JSON-lines worker (async model init + jobs)
+│   ├── algorithm.py               # Scan loop, boundary tracking, 3-frame median, batching, merge
+│   ├── math_engine.py             # Text-focused edge signature and symmetric comparison
+│   ├── requirements.txt           # Python engine dependencies
+│   └── models/
+│       └── ocr_engine.py          # Hybrid RapidOCR (PP-OCRv6/v5) + EasyOCR wrapper
+└── frontend/
+    ├── package.json
+    ├── public/favicon.svg
+    └── src/
+        ├── App.tsx                # Studio UI, ResizeObserver ROI monitor, inline SRT table
+        ├── styles.css
+        ├── types.ts
+        └── wails.d.ts
 ```
-## Installation
 
-The project currently targets Windows with an NVIDIA GPU and CUDA-enabled PyTorch.
+---
 
-Prerequisites:
+## Installation (Windows)
 
-- Go 1.23 or newer;
-- Node.js and npm;
-- Python 3.13;
-- Microsoft Edge WebView2 Runtime;
-- NVIDIA driver and a CUDA-compatible PyTorch installation.
+### Prerequisites
+
+- **Go**: `1.25` or newer
+- **Node.js & npm**: Node `18+` (tested with Node `24` / npm `11`)
+- **Python**: `3.10` – `3.13` (64-bit)
+- **Microsoft Edge WebView2 Runtime**: Pre-installed on Windows 10/11
+- **NVIDIA Driver & CUDA PyTorch** *(optional)*: Only needed for GPU acceleration in EasyOCR (`Vietnamese` mode). `RapidOCR` runs via ONNX Runtime without requiring CUDA PyTorch.
+
+### 1. Set Up the Python Environment
 
 From the project root:
 
@@ -235,66 +270,98 @@ python -m venv .venv
 python -m pip install --upgrade pip
 ```
 
-Install a CUDA-enabled PyTorch build that matches the machine. For the current CUDA 12.8 environment, the command is:
+#### Optional: Install CUDA PyTorch (for GPU EasyOCR)
+
+If you use an NVIDIA GPU, install **both `torch` and `torchvision`** from the PyTorch CUDA index **before** installing `engine\requirements.txt`. Installing `easyocr` directly from PyPI first will pull CPU-only PyTorch wheels and cause automatic fallback to CPU.
+
+For CUDA 12.8:
 
 ```powershell
-python -m pip install torch --index-url https://download.pytorch.org/whl/cu128
+python -m pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128
 ```
 
-Then install the remaining Python dependencies:
+Verify CUDA is active:
+
+```powershell
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+Expected output ends with `True` (e.g., `2.11.0+cu128 12.8 True`).
+
+#### Install Remaining Engine Dependencies
 
 ```powershell
 python -m pip install -r engine\requirements.txt
 ```
 
-Install frontend dependencies:
+> Model weights for `RapidOCR` and `EasyOCR` are downloaded automatically on first use for each language.
+
+### 2. Install & Build the Frontend
 
 ```powershell
 cd frontend
 npm install
+npm run build
 cd ..
 ```
 
-If Python is installed somewhere else, set its path before running the app:
+*(Because `main.go` embeds `frontend/dist` with `//go:embed all:frontend/dist`, `npm run build` must run at least once before `go run .`, `go vet`, or `go build`.)*
 
-```powershell
-$env:SUBTITLE_PYTHON = "C:\Path\To\python.exe"
-```
+---
 
-## Run without a production build
+## Run Without a Production Build
 
-You do not need to build `subtitle-studio.exe` during development. Run Wails development mode from the project root:
+To run Wails in development mode with live frontend hot reload (no `.exe` build needed):
 
 ```powershell
 go run github.com/wailsapp/wails/v2/cmd/wails@v2.13.0 dev
 ```
 
-This starts the React development server, compiles the Go backend on demand, opens the Wails development window, and enables frontend hot reload.
-
-To run the Go app directly with the already-built frontend assets:
+To launch the Go desktop app directly against already-built `frontend/dist` assets:
 
 ```powershell
 go run .
 ```
 
-To inspect only the Python worker protocol in a terminal:
+To inspect only the Python worker JSON-lines protocol in a terminal:
 
 ```powershell
 .\.venv\Scripts\python.exe -u engine\worker.py
 ```
 
-The worker expects JSON-lines commands on stdin. The desktop app normally sends these commands through Go.
+The worker reads JSON-lines commands from `stdin` (send `{"type":"shutdown"}` to exit cleanly).
 
-## Production build
+---
 
-When a standalone executable is needed:
+## Production Build
+
+Build the standalone Windows executable into `build/bin/subtitle-studio.exe`:
 
 ```powershell
-go run github.com/wailsapp/wails/v2/cmd/wails@v2.13.0 build
+go run github.com/wailsapp/wails/v2/cmd/wails@v2.13.0 build -clean
 ```
 
-The executable is written to `build/bin`. It still needs access to the `engine` directory and the Python environment, unless `SUBTITLE_PYTHON` is configured separately.
+The executable searches for Python in this order:
+1. `SUBTITLE_PYTHON` environment variable (if set)
+2. `.venv\Scripts\python.exe` relative to the working directory or executable location
+3. `python` / `python3` in system `PATH`
+
+It also requires access to the `engine/` directory unless bundled alongside the executable.
+
+### Optional Environment Variables
+
+| Variable | Effect |
+|---|---|
+| `SUBTITLE_PYTHON` | Custom path to `python.exe` |
+| `SUBTITLE_REQUIRE_CUDA` | Set to `1` to fail startup instead of falling back to CPU when CUDA is unavailable in PyTorch |
+
+```powershell
+$env:SUBTITLE_PYTHON = "C:\Path\To\python.exe"
+$env:SUBTITLE_REQUIRE_CUDA = "1"
+```
+
+---
 
 ## Notes
 
-This project was not originally intended to become a full application. It started as a learning project focused on Python, OCR, image processing, and workflow optimization. The current interface is a quick prototype assembled with the help of AI. If you find a bug or unexpected behavior, please open an issue.
+This project started as a learning project focused on Python, OCR, image processing, and workflow optimization rather than a full consumer product. The desktop interface was built around the detection engine so the extraction pipeline, timing parameters, and OCR results can be tested interactively. If you run into a bug or unexpected behavior, feel free to open an issue.

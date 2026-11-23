@@ -70,6 +70,23 @@ function App() {
   const [error, setError] = useState('')
   const listEndRef = useRef<HTMLDivElement | null>(null)
   const previewSeqRef = useRef(0)
+  const canvasRef = useRef<HTMLDivElement | null>(null)
+  const [canvasSize, setCanvasSize] = useState({ width: 0, height: 0 })
+
+  useEffect(() => {
+    const el = canvasRef.current
+    if (!el) return
+    const updateSize = () => {
+      setCanvasSize({
+        width: Math.max(0, el.clientWidth - 32),
+        height: Math.max(0, el.clientHeight - 32),
+      })
+    }
+    updateSize()
+    const observer = new ResizeObserver(updateSize)
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [])
 
   useEffect(() => {
     getAppApi()
@@ -145,6 +162,17 @@ function App() {
       px: `${pxW}×${pxH} px`,
     }
   }, [crop, preview])
+
+  const fittedImageStyle = useMemo(() => {
+    if (!preview || canvasSize.width <= 0 || canvasSize.height <= 0) {
+      return { maxWidth: '100%', maxHeight: 'calc(100vh - 410px)' }
+    }
+    const scale = Math.min(canvasSize.width / preview.width, canvasSize.height / preview.height)
+    return {
+      width: `${Math.max(1, Math.floor(preview.width * scale))}px`,
+      height: `${Math.max(1, Math.floor(preview.height * scale))}px`,
+    }
+  }, [preview, canvasSize])
 
   const filteredSubtitles = useMemo(() => {
     const query = searchQuery.trim().toLowerCase()
@@ -418,7 +446,7 @@ function App() {
             </div>
           </div>
 
-          <div className="monitor-canvas">
+          <div className="monitor-canvas" ref={canvasRef}>
             {preview ? (
               <ReactCrop
                 crop={crop}
@@ -428,7 +456,12 @@ function App() {
                 keepSelection
                 disabled={running}
               >
-                <img src={preview.image} alt="Video frame preview" draggable={false} />
+                <img
+                  src={preview.image}
+                  alt="Video frame preview"
+                  draggable={false}
+                  style={fittedImageStyle}
+                />
               </ReactCrop>
             ) : (
               <div className="monitor-empty">
