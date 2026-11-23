@@ -35,14 +35,16 @@ type WorkerMessage struct {
 type PythonWorker struct {
 	onEvent func(WorkerMessage)
 
-	mu      sync.RWMutex
-	writeMu sync.Mutex
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	ready   bool
-	closed  bool
-	done    chan struct{}
-	pending map[string]chan WorkerMessage
+	mu        sync.RWMutex
+	writeMu   sync.Mutex
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	ready     bool
+	closed    bool
+	fatalSent bool
+	lastLogs  []string
+	done      chan struct{}
+	pending   map[string]chan WorkerMessage
 }
 
 func NewPythonWorker(onEvent func(WorkerMessage)) *PythonWorker {
@@ -94,11 +96,20 @@ func (w *PythonWorker) Start() error {
 		err := cmd.Wait()
 		w.mu.Lock()
 		wasClosed := w.closed
+		fatalSent := w.fatalSent
+		tail := strings.Join(w.lastLogs, " | ")
 		w.ready = false
 		w.closed = true
 		w.mu.Unlock()
-		if err != nil && !wasClosed && w.onEvent != nil {
-			w.onEvent(WorkerMessage{Type: "fatal", Message: "Python worker stopped: " + err.Error()})
+		if !wasClosed && !fatalSent && w.onEvent != nil {
+			msg := "Python worker stopped"
+			if err != nil {
+				msg += ": " + err.Error()
+			}
+			if tail != "" {
+				msg += " (" + tail + ")"
+			}
+			w.onEvent(WorkerMessage{Type: "fatal", Message: msg})
 		}
 		close(w.done)
 	}()
@@ -125,6 +136,7 @@ func (w *PythonWorker) readMessages(reader io.Reader) {
 		if message.Type == "fatal" {
 			w.mu.Lock()
 			w.ready = false
+			w.fatalSent = true
 			w.mu.Unlock()
 		}
 
@@ -153,7 +165,16 @@ func (w *PythonWorker) readLogs(reader io.Reader) {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 16*1024), 2*1024*1024)
 	for scanner.Scan() {
-		fmt.Printf("[python] %s\n", scanner.Text())
+		line := strings.TrimSpace(scanner.Text())
+		fmt.Printf("[python] %s\n", line)
+		if line != "" {
+			w.mu.Lock()
+			w.lastLogs = append(w.lastLogs, line)
+			if len(w.lastLogs) > 6 {
+				w.lastLogs = w.lastLogs[len(w.lastLogs)-6:]
+			}
+			w.mu.Unlock()
+		}
 	}
 }
 
@@ -179,6 +200,17 @@ func (w *PythonWorker) send(command any) error {
 	return nil
 }
 
+func (w *PythonWorker) ensureRunning() error {
+	w.mu.RLock()
+	closed := w.closed
+	stdin := w.stdin
+	w.mu.RUnlock()
+	if closed || stdin == nil {
+		return errors.New("Python worker is not running")
+	}
+	return nil
+}
+
 func (w *PythonWorker) ensureReady() error {
 	w.mu.RLock()
 	ready := w.ready
@@ -188,13 +220,13 @@ func (w *PythonWorker) ensureReady() error {
 		return errors.New("Python worker has stopped")
 	}
 	if !ready {
-		return errors.New("OCR model is not ready")
+		return errors.New("OCR model is still loading")
 	}
 	return nil
 }
 
 func (w *PythonWorker) Preview(videoPath string, ratio float64) (FramePreview, error) {
-	if err := w.ensureReady(); err != nil {
+	if err := w.ensureRunning(); err != nil {
 		return FramePreview{}, err
 	}
 	absoluteVideoPath, err := filepath.Abs(videoPath)
@@ -254,6 +286,8 @@ func (w *PythonWorker) StartJob(jobID string, config JobConfig) error {
 		"boundary_step":         config.BoundaryStep,
 		"max_subtitle_duration": config.MaxSubtitleSeconds,
 		"min_confidence":        config.MinConfidence,
+		"language":              config.Language,
+		"preprocess_mode":       config.PreprocessMode,
 		"debug_timing":          config.DebugTiming,
 	})
 }
@@ -300,7 +334,15 @@ func resolveWorkerPaths() (string, string, error) {
 	}
 	pythonPath := firstExistingFile(pythonCandidates)
 	if pythonPath == "" {
-		return "", "", errors.New("Python was not found in .venv; set SUBTITLE_PYTHON to use another interpreter")
+		for _, bin := range []string{"python", "python3"} {
+			if lookedUp, err := exec.LookPath(bin); err == nil && lookedUp != "" {
+				pythonPath = lookedUp
+				break
+			}
+		}
+	}
+	if pythonPath == "" {
+		return "", "", errors.New("Python was not found in .venv or PATH; set SUBTITLE_PYTHON to use another interpreter")
 	}
 
 	workerCandidates := make([]string, 0, len(roots))

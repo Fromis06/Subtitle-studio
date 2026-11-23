@@ -27,6 +27,8 @@ type JobConfig struct {
 	BoundaryStep       float64 `json:"boundaryStep"`
 	MaxSubtitleSeconds float64 `json:"maxSubtitleSeconds"`
 	MinConfidence      float64 `json:"minConfidence"`
+	Language           string  `json:"language"`
+	PreprocessMode     string  `json:"preprocessMode"`
 	DebugTiming        bool    `json:"debugTiming"`
 }
 
@@ -159,6 +161,12 @@ func (a *App) StartJob(config JobConfig) (string, error) {
 	if a.worker == nil {
 		return "", errors.New("Python worker has not started")
 	}
+	if config.Language == "" {
+		config.Language = "auto"
+	}
+	if config.PreprocessMode == "" {
+		config.PreprocessMode = "natural"
+	}
 	if err := validateJobConfig(config); err != nil {
 		return "", err
 	}
@@ -205,6 +213,16 @@ func validateJobConfig(config JobConfig) error {
 	if config.MinConfidence < 0.1 || config.MinConfidence > 0.95 {
 		return errors.New("OCR confidence must be between 0.1 and 0.95")
 	}
+	switch config.Language {
+	case "auto", "en", "ja", "zh", "vi", "ko":
+	default:
+		return errors.New("unsupported OCR language")
+	}
+	switch config.PreprocessMode {
+	case "natural", "clean":
+	default:
+		return errors.New("unsupported preprocess mode")
+	}
 	return nil
 }
 
@@ -221,11 +239,50 @@ func (a *App) CancelJob() error {
 	return a.worker.Cancel(jobID)
 }
 
-func (a *App) SaveSRT() (string, error) {
+func (a *App) RestartWorker() error {
+	a.mu.Lock()
+	if a.activeJobID != "" {
+		a.mu.Unlock()
+		return errors.New("cannot restart worker while a job is running")
+	}
+	oldWorker := a.worker
+	a.mu.Unlock()
+
+	if oldWorker != nil {
+		oldWorker.Shutdown()
+	}
+
+	a.setWorkerState("starting", "Restarting Python worker…")
+	newWorker := NewPythonWorker(a.handleWorkerEvent)
+	a.mu.Lock()
+	a.worker = newWorker
+	a.mu.Unlock()
+
+	if err := newWorker.Start(); err != nil {
+		a.setWorkerState("error", err.Error())
+		return err
+	}
+	return nil
+}
+
+func (a *App) FormatSRTText(customSubtitles []Subtitle) string {
+	subtitles := customSubtitles
+	if len(subtitles) == 0 {
+		a.mu.RLock()
+		subtitles = append([]Subtitle(nil), a.lastSubtitles...)
+		a.mu.RUnlock()
+	}
+	return formatSRT(subtitles)
+}
+
+func (a *App) SaveSRT(customSubtitles []Subtitle) (string, error) {
 	a.mu.RLock()
 	subtitles := append([]Subtitle(nil), a.lastSubtitles...)
 	videoPath := a.lastVideoPath
 	a.mu.RUnlock()
+	if len(customSubtitles) > 0 {
+		subtitles = customSubtitles
+	}
 	if len(subtitles) == 0 {
 		return "", errors.New("no subtitles available to save")
 	}

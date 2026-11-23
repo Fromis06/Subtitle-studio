@@ -8,15 +8,21 @@ import (
 
 func formatSRT(subtitles []Subtitle) string {
 	var builder strings.Builder
-	for i, subtitle := range subtitles {
+	index := 1
+	for _, subtitle := range subtitles {
+		text := strings.TrimSpace(subtitle.Text)
+		if text == "" {
+			continue
+		}
 		fmt.Fprintf(
 			&builder,
 			"%d\r\n%s --> %s\r\n%s\r\n\r\n",
-			i+1,
+			index,
 			formatSRTTime(subtitle.Start),
 			formatSRTTime(subtitle.End),
-			strings.TrimSpace(subtitle.Text),
+			text,
 		)
+		index++
 	}
 	return builder.String()
 }

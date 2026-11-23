@@ -39,5 +39,7 @@ export type JobConfig = {
   boundaryStep: number
   maxSubtitleSeconds: number
   minConfidence: number
+  language: string
+  preprocessMode: string
   debugTiming: boolean
 }

@@ -22,7 +22,7 @@ func main() {
 		MinWidth:         980,
 		MinHeight:        680,
 		Frameless:        false,
-		BackgroundColour: &options.RGBA{R: 12, G: 16, B: 24, A: 1},
+		BackgroundColour: &options.RGBA{R: 13, G: 15, B: 18, A: 1},
 		AssetServer:      &assetserver.Options{Assets: assets},
 		OnStartup:        app.startup,
 		OnShutdown:       app.shutdown,

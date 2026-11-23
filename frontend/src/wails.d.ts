@@ -1,4 +1,4 @@
-import type { FramePreview, JobConfig, WorkerState } from './types'
+import type { FramePreview, JobConfig, Subtitle, WorkerState } from './types'
 
 declare global {
   interface Window {
@@ -6,11 +6,13 @@ declare global {
       main: {
         App: {
           GetWorkerState(): Promise<WorkerState>
+          RestartWorker(): Promise<void>
           SelectVideo(): Promise<string>
           GetVideoPreview(videoPath: string, ratio: number): Promise<FramePreview>
           StartJob(config: JobConfig): Promise<string>
           CancelJob(): Promise<void>
-          SaveSRT(): Promise<string>
+          SaveSRT(customSubtitles: Subtitle[]): Promise<string>
+          FormatSRTText(customSubtitles: Subtitle[]): Promise<string>
         }
       }
     }
